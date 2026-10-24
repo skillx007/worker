@@ -1,0 +1,247 @@
+name: SkillX Django Prod Deploy
+
+"on":
+  repository_dispatch:
+    types: [skillx-django-prod-deploy]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    name: Build image & push to GHCR
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      base: ${{ steps.meta.outputs.base }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repository }}
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.SKILLX_PRIVATE_REPO_PAT }}
+
+      - name: Set image tags
+        id: meta
+        shell: bash
+        run: |
+          SHA="${{ github.event.client_payload.sha || github.sha }}"
+          SHA="${SHA:0:12}"
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          BASE="ghcr.io/${OWNER_LC}/skillx-django"
+          echo "image=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.sha }}
+            ${{ steps.meta.outputs.base }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Migrate, swap & healthcheck on droplet
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Load secrets from Infisical
+        uses: Infisical/secrets-action@v1.0.7
+        with:
+          method: universal
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          project-slug: ${{ secrets.SKILLX_INFISICAL_PROJECT_SLUG }}
+          env-slug: prod
+          secret-path: /backend
+          export-type: env
+
+      - name: Prepare SSH key
+        id: ssh
+        shell: bash
+        run: |
+          : "${DROPLET_HOST:?missing DROPLET_HOST from Infisical}"
+          : "${DROPLET_USER:?missing DROPLET_USER from Infisical}"
+          : "${DROPLET_SSH_KEY:?missing DROPLET_SSH_KEY from Infisical}"
+          : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR from Infisical}"
+
+          key_path="$RUNNER_TEMP/skillx_django_deploy_key"
+          printf '%b\n' "$DROPLET_SSH_KEY" > "$key_path"
+          chmod 600 "$key_path"
+
+          if ! grep -q 'BEGIN .*PRIVATE KEY' "$key_path"; then
+            echo "::error::DROPLET_SSH_KEY must be the full private key, not the .pub key."
+            exit 1
+          fi
+
+          {
+            echo "host=$DROPLET_HOST"
+            echo "username=$DROPLET_USER"
+            echo "key_path=$key_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: SSH in, migrate, swap server, healthcheck, rollback on failure
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE: ${{ needs.build-push.outputs.image }}
+          IMAGE_BASE: ${{ needs.build-push.outputs.base }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PAT: ${{ env.GHCR_PAT }}
+          DROPLET_APP_DIR: ${{ env.DROPLET_APP_DIR }}
+        with:
+          host: ${{ steps.ssh.outputs.host }}
+          username: ${{ steps.ssh.outputs.username }}
+          key_path: ${{ steps.ssh.outputs.key_path }}
+          envs: IMAGE,IMAGE_BASE,GHCR_USERNAME,GHCR_PAT,DROPLET_APP_DIR
+          script: |
+            set -euo pipefail
+            : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR}"
+            cd "$DROPLET_APP_DIR"
+            if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+              echo "DROPLET_APP_DIR must point to the cloned repo. Current value: $DROPLET_APP_DIR"
+              ls -la "$DROPLET_APP_DIR"
+              exit 1
+            fi
+            git fetch --prune origin
+            git pull --ff-only
+            test -f docker-compose.yml || test -f compose.yml
+
+            if ! test -r /etc/infisical.env; then
+              echo "/etc/infisical.env is not readable by $(whoami). Fix ownership/permissions or deploy as a user that can read it."
+              exit 1
+            fi
+            set -a
+            . /etc/infisical.env
+            set +a
+            : "${INFISICAL_CLIENT_ID:?missing INFISICAL_CLIENT_ID in /etc/infisical.env}"
+            : "${INFISICAL_CLIENT_SECRET:?missing INFISICAL_CLIENT_SECRET in /etc/infisical.env}"
+            : "${INFISICAL_PROJECT_ID:?missing INFISICAL_PROJECT_ID in /etc/infisical.env}"
+
+            export INFISICAL_DISABLE_UPDATE_CHECK=true
+            export INFISICAL_TOKEN="$(infisical login --method=universal-auth --client-id="$INFISICAL_CLIENT_ID" --client-secret="$INFISICAL_CLIENT_SECRET" --plain --silent)"
+            infisical export --silent --token="$INFISICAL_TOKEN" --projectId="$INFISICAL_PROJECT_ID" --env=prod --path=/backend --format=dotenv > .env.tmp
+            mv .env.tmp .env
+            chmod 600 .env
+
+            echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+
+            # 1. Save previous image for rollback (read from running container before any change)
+            PREV_IMAGE="$(docker compose ps --format '{{.Image}}' server 2>/dev/null | head -n1 || true)"
+            echo "previous image: ${PREV_IMAGE:-<none>}"
+
+            export IMAGE
+
+            # 2. Pull new image (no traffic impact yet)
+            docker compose pull server
+
+            # 2a. Ensure db is up + healthy (idempotent).
+            docker compose up -d db
+            for i in $(seq 1 30); do
+              db_status="$(docker inspect --format='{{.State.Health.Status}}' "$(docker compose ps -q db)" 2>/dev/null || echo starting)"
+              echo "db health[$i]: $db_status"
+              [ "$db_status" = "healthy" ] && break
+              sleep 2
+            done
+            if [ "$db_status" != "healthy" ]; then
+              echo "::error::db not healthy, aborting deploy"
+              exit 1
+            fi
+
+            # 3. Run migrate against new image BEFORE swapping server container.
+            #    If migrate fails: old container still serves traffic. Abort.
+            if ! docker compose run --rm server python manage.py migrate --noinput; then
+              echo "::error::migrate failed on new image, aborting deploy"
+              exit 1
+            fi
+
+            # 4. Swap server container. Old keeps serving until new is healthy.
+            if ! docker compose up -d --no-deps --remove-orphans server; then
+              echo "::error::compose up failed, rolling back"
+              if [ -n "$PREV_IMAGE" ]; then
+                IMAGE="$PREV_IMAGE" docker compose up -d --no-deps server || true
+              fi
+              exit 1
+            fi
+
+            # 5. Wait for healthcheck; rollback if it never goes healthy.
+            for i in $(seq 1 30); do
+                health_status="$(docker inspect --format='{{.State.Health.Status}}' "$(docker compose ps -q server)" 2>/dev/null || echo starting)"
+                echo "health[$i]: $health_status"
+            
+                [ "$health_status" = "healthy" ] && break
+                [ "$health_status" = "unhealthy" ] && break
+            
+                sleep 2
+            done
+            
+            if [ "$health_status" != "healthy" ]; then
+                echo "::error::server unhealthy after deploy, rolling back to $PREV_IMAGE"
+            
+                if [ -n "$PREV_IMAGE" ]; then
+                    IMAGE="$PREV_IMAGE" docker compose up -d --no-deps server
+                fi
+            
+                exit 1
+            fi
+
+            # 6. Cleanup dangling images, keep volumes.
+            docker image prune -f
+
+  notify-pr:
+    name: Comment deployment status on PR
+    needs: deploy
+    if: |
+      always() &&
+      github.event.client_payload.pr_number != null
+    runs-on: ubuntu-latest
+
+    env:
+      PRIVATE_REPO: ${{ github.event.client_payload.repository }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+      SHA: ${{ github.event.client_payload.sha }}
+
+    steps:
+      - name: Comment deployment status on PR (success)
+        if: needs.deploy.result == 'success'
+        run: |
+          set -euo pipefail
+
+          curl -fsS -X POST \
+            -H "Authorization: token ${{ secrets.SKILLX_PRIVATE_REPO_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${PR_NUMBER}/comments" \
+            -d "$(jq -cn \
+              --arg sha "$SHA" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{body:("✅ Production deployment succeeded")}')"
+
+      - name: Comment deployment status on PR (failure)
+        if: needs.deploy.result != 'success'
+        run: |
+          set -euo pipefail
+
+          curl -fsS -X POST \
+            -H "Authorization: token ${{ secrets.SKILLX_PRIVATE_REPO_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${PR_NUMBER}/comments" \
+            -d "$(jq -cn \
+              --arg sha "$SHA" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{body:("❌ Production deployment failed")}')"
