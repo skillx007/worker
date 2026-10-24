@@ -1,0 +1,146 @@
+# Postgres backup pipeline (droplet -> R2).
+#
+# Runs on GH Actions cron, 2x/day (00:00, 12:00 UTC). Also triggerable by
+
+name: db-backup
+
+on:
+  repository_dispatch:
+    types: [db_backup]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 0 * * *"
+    - cron: "0 12 * * *"
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dump-and-upload:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Load secrets from Infisical
+        uses: Infisical/secrets-action@v1.0.7
+        with:
+          method: universal
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          project-slug: ${{ secrets.SKILLX_INFISICAL_PROJECT_SLUG }}
+          env-slug: prod
+          secret-path: /backend
+          recursive: true
+          export-type: env
+
+      - name: Prepare SSH key
+        id: ssh
+        shell: bash
+        run: |
+          : "${DROPLET_HOST:?missing DROPLET_HOST from Infisical}"
+          : "${DROPLET_USER:?missing DROPLET_USER from Infisical}"
+          : "${DROPLET_SSH_KEY:?missing DROPLET_SSH_KEY from Infisical}"
+          : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR from Infisical}"
+
+          key_path="$RUNNER_TEMP/skillx_db_backup_key"
+          printf '%b\n' "$DROPLET_SSH_KEY" > "$key_path"
+          chmod 600 "$key_path"
+
+          if ! grep -q 'BEGIN .*PRIVATE KEY' "$key_path"; then
+            echo "::error::DROPLET_SSH_KEY must be the full private key, not the .pub key."
+            exit 1
+          fi
+
+          {
+            echo "host=$DROPLET_HOST"
+            echo "username=$DROPLET_USER"
+            echo "key_path=$key_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dump Postgres and upload to R2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DROPLET_APP_DIR: ${{ env.DROPLET_APP_DIR }}
+          # Backup-only creds, fetched straight from Infisical above — do NOT
+          # depend on the deploy workflow's droplet .env for these (it's
+          # rendered non-recursively from /backend and won't have them
+          # unless the deploy workflow also opts into subfolder secrets).
+          R2_BACKUP_ACCESS_KEY_ID: ${{ env.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ env.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET: ${{ env.R2_BACKUP_BUCKET }}
+          R2_ACCOUNT_ID: ${{ env.R2_ACCOUNT_ID }}
+        with:
+          host: ${{ steps.ssh.outputs.host }}
+          username: ${{ steps.ssh.outputs.username }}
+          key_path: ${{ steps.ssh.outputs.key_path }}
+          envs: DROPLET_APP_DIR,R2_BACKUP_ACCESS_KEY_ID,R2_BACKUP_SECRET_ACCESS_KEY,R2_BACKUP_BUCKET,R2_ACCOUNT_ID
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            : "${DROPLET_APP_DIR:?missing DROPLET_APP_DIR}"
+            cd "$DROPLET_APP_DIR"
+
+            # .env rendered by deploy workflow via Infisical. Contains POSTGRES_*
+            # (db creds must match the running container).
+            if [ ! -f .env ]; then
+              echo "::error::${DROPLET_APP_DIR}/.env missing; run deploy first"
+              exit 1
+            fi
+            set -a
+            . ./.env
+            set +a
+
+            : "${POSTGRES_DB:?POSTGRES_DB not set}"
+            : "${POSTGRES_USER:?POSTGRES_USER not set}"
+            # Scoped creds for backup bucket only (Object R/W, no delete), passed in
+            # from the job env — not sourced from .env. Do NOT reuse media creds.
+            : "${R2_BACKUP_ACCESS_KEY_ID:?R2_BACKUP_ACCESS_KEY_ID not set}"
+            : "${R2_BACKUP_SECRET_ACCESS_KEY:?R2_BACKUP_SECRET_ACCESS_KEY not set}"
+            # Dedicated backup bucket (private, no public domain). Do NOT reuse media bucket.
+            : "${R2_BACKUP_BUCKET:?R2_BACKUP_BUCKET not set}"
+            : "${R2_ACCOUNT_ID:?R2_ACCOUNT_ID not set (needed to derive R2_ENDPOINT)}"
+            R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+            TS="$(date -u +%Y%m%dT%H%M%SZ)"
+            FILE="edvube-${POSTGRES_DB}-${TS}.dump"
+            TMP="/tmp/${FILE}"
+            KEY="db-backups/$(date -u +%Y-%m)/${FILE}"
+
+            # Ensure db container running and healthy before dumping.
+            db_status="$(docker inspect --format='{{.State.Health.Status}}' "$(docker compose ps -q db)" 2>/dev/null || echo missing)"
+            if [ "$db_status" != "healthy" ]; then
+              echo "::error::db not healthy (status=$db_status), aborting backup"
+              exit 1
+            fi
+
+            echo "dumping ${POSTGRES_DB} -> ${TMP}"
+            # -Fc: custom format (compressed, supports pg_restore -j/-t/-L)
+            docker compose exec -T db \
+              pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+              -Fc --no-owner --no-privileges \
+              > "$TMP"
+
+            SIZE=$(stat -c%s "$TMP")
+            echo "dump size: ${SIZE} bytes"
+            if [ "$SIZE" -lt 1024 ]; then
+              echo "::error::dump suspiciously small (<1KB), aborting upload"
+              rm -f "$TMP"
+              exit 1
+            fi
+
+            echo "uploading to r2://${R2_BACKUP_BUCKET}/${KEY}"
+            docker run --rm \
+              -v /tmp:/tmp \
+              -e AWS_ACCESS_KEY_ID="$R2_BACKUP_ACCESS_KEY_ID" \
+              -e AWS_SECRET_ACCESS_KEY="$R2_BACKUP_SECRET_ACCESS_KEY" \
+              -e AWS_DEFAULT_REGION=auto \
+              amazon/aws-cli:latest \
+              s3 cp "$TMP" "s3://${R2_BACKUP_BUCKET}/${KEY}" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --checksum-algorithm CRC32
+
+            rm -f "$TMP"
+            echo "backup uploaded: ${KEY}"
