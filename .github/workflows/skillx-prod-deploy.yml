@@ -1,8 +1,8 @@
-name: SkillX Django Prod Deploy
+name: MaxSkills Django Prod Deploy
 
 "on":
   repository_dispatch:
-    types: [skillx-django-prod-deploy]
+    types: [maxskills-django-prod-deploy]
   workflow_dispatch: {}
 
 permissions:
