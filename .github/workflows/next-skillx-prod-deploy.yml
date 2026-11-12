@@ -22,7 +22,7 @@ jobs:
         with:
           repository: ${{ github.event.client_payload.repository }}
           ref: ${{ github.event.client_payload.ref }}
-          token: ${{ secrets.SKILLX_PRIVATE_REPO_PAT }}
+          token: ${{ secrets.NEXT_SKILLX_PRIVATE_REPO_PAT }}
 
       - name: Set image tags
         id: meta
