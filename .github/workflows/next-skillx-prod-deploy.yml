@@ -24,6 +24,23 @@ jobs:
           ref: ${{ github.event.client_payload.ref }}
           token: ${{ secrets.NEXT_SKILLX_PRIVATE_REPO_PAT }}
 
+      - name: Verify repository checkout
+        run: |
+          echo "Repository: ${{ github.event.client_payload.repository }}"
+          echo "Branch: ${{ github.event.client_payload.ref }}"
+
+          echo "Current directory:"
+          pwd
+
+          echo "Files:"
+          ls -la
+
+          echo "Dockerfile:"
+          test -f Dockerfile && echo "Dockerfile FOUND" || {
+            echo "Dockerfile NOT FOUND"
+            exit 1
+          }
+
       - name: Set image tags
         id: meta
         shell: bash
@@ -49,6 +66,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile
           push: true
           tags: |
             ${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.sha }}
@@ -164,12 +182,6 @@ jobs:
               exit 1
             fi
 
-            # 3. Run migrate against new image BEFORE swapping server container.
-            #    If migrate fails: old container still serves traffic. Abort.
-            if ! docker compose run --rm server python manage.py migrate --noinput; then
-              echo "::error::migrate failed on new image, aborting deploy"
-              exit 1
-            fi
 
             # 4. Swap server container. Old keeps serving until new is healthy.
             if ! docker compose up -d --no-deps --remove-orphans server; then
